@@ -1,0 +1,4 @@
+- pegar importação
+- aumentar produtos (Matheus)
+- Salvar pdf governo e scraping da pagina (por hora diretório na própria pasta)
+- salvar no nosso schema BRADODW_IM_PRICING
