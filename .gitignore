@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Saídas locais da extração (Excel de validação e arquivos brutos do MDIC)
+saida/
