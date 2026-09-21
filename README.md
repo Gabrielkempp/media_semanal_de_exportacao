@@ -43,14 +43,32 @@ extrair-para-excel.bat --reprocessar    :: reconstrói o Excel inteiro a partir 
 
 1. Baixa a página (HTML estático, sem Selenium) e todos os arquivos linkados nela (planilhas e `Nota.pdf`). Salva tudo em `saida/brutos/<ano>-<mes>_semana<n>/`. **Essa pasta é a fonte da verdade**: as planilhas do site têm URL fixa e são substituídas toda semana.
 2. Processa cada divulgação arquivada que ainda não está no Excel, além da atual. Uma semana que falhou ou não foi gravada entra sozinha na execução seguinte.
-3. Valida antes de gravar:
+3. Valida antes de gravar, sempre sobre a divulgação **inteira** (todos os produtos, exportação e importação):
    - a página e as planilhas são da mesma semana;
    - o layout das planilhas é o esperado;
    - os produtos somam o setor, os setores somam o total da `Tabela_Resumo` e as semanas somam o mês;
    - a variação publicada bate com média diária ÷ base do ano anterior.
 
    Se algo falhar, aquela divulgação não entra e o erro vai para `saida/extracao.log`.
-4. Grava o Excel num arquivo temporário e troca no fim. Reexecutar a mesma semana substitui as linhas dela, sem duplicar. Se a estrutura das tabelas mudar no código, o Excel é reconstruído automaticamente a partir dos brutos.
+4. **Só no fim** reduz ao que está configurado para captura (ver abaixo) e grava.
+5. Grava o Excel num arquivo temporário e troca no fim. Reexecutar a mesma semana substitui as linhas dela, sem duplicar. Se a estrutura das tabelas mudar no código, o Excel é reconstruído automaticamente a partir dos brutos.
+
+### O que é capturado (configurável)
+
+No topo de [`src/principais_resultados.py`](src/principais_resultados.py):
+
+```python
+PRODUTOS_CAPTURADOS = [   # None = todos os produtos da divulgação
+    'Algodão em bruto',
+    'Madeira em bruto',
+    'Milho não moído, exceto milho doce',
+]
+FLUXOS_CAPTURADOS = [EXPORTACAO]   # [EXPORTACAO, IMPORTACAO] para capturar os dois
+```
+
+O recorte vale só para a tabela final. **Os arquivos brutos continuam guardando a divulgação completa**, então para ampliar a captura basta editar as listas e rodar `extrair-para-excel.bat --reprocessar`: todo o histórico já arquivado é refeito com os produtos novos, sem perder nada.
+
+A comparação do nome ignora acento, maiúscula/minúscula e espaços extras. Se um produto configurado não existir na divulgação (sinal de que o MDIC mudou o nome), a execução **para com erro** em vez de gravar a semana sem ele.
 
 O código de saída é 1 quando a divulgação atual falha, e o Agendador de Tarefas mostra isso em "Resultado da última execução". **Agende para rodar diariamente, por exemplo às 18h.** O MDIC publica às segundas, entre 15h e 15h30. Rodar a mais não custa nada e cobre atrasos da publicação.
 
@@ -58,18 +76,18 @@ O código de saída é 1 quando a divulgação atual falha, e o Agendador de Tar
 
 | Aba | Conteúdo |
 |---|---|
-| `DADOS` | **A tabela.** Uma linha por produto (exportação ou importação) em cada divulgação semanal. Cerca de 575 linhas por semana. |
-| `TEXTOS` | Um parágrafo por linha das seções Destaques, Totais e Setores e Produtos. |
-| `LEIA-ME` | Regras de uso e o dicionário de todas as colunas. |
+| `DADOS` | **A tabela de análise.** Uma linha por produto capturado em cada divulgação semanal (hoje: 3 produtos de exportação). |
+| `TEXTOS` | Um parágrafo por linha das seções Destaques, Totais e Setores e Produtos, como publicados — inclui exportação e importação. |
+| `LEIA-ME` | Regras de uso e o dicionário de todas as colunas, montado a partir do que está configurado para captura. |
 
 `DADOS` e `TEXTOS` são Tabelas do Excel com esses mesmos nomes, que é o que o Power BI lista ao importar.
 
-**Setor e total não são gravados: são a soma dos produtos** (conferido a cada divulgação contra a `Tabela_Resumo` do MDIC). Assim, somar qualquer coluna de valor dentro de uma divulgação nunca conta nada em dobro.
+Setores e totais não são gravados. Com a captura em todos os produtos (`PRODUTOS_CAPTURADOS = None`), eles são exatamente a soma das linhas. **Com o recorte atual, a soma das linhas não é o total do setor nem do Brasil** — é só o subtotal daqueles produtos.
 
 Colunas de `DADOS`, em grupos:
 
-- **Quando**: `DATA_REFERENCIA` (último dia coberto), `DATA_PUBLICACAO`, `ANO`, `MES`, `SEMANA`, `DIAS_UTEIS_ACUMULADO_MES`, `DIAS_UTEIS_SEMANA`, `ULTIMA_DO_MES`, `MAIS_RECENTE`.
-- **O quê**: `FLUXO`, `SETOR`, `PRODUTO`.
+- **Quando**: `DATA_REFERENCIA` (último dia coberto), `DATA_PUBLICACAO`, `ANO`, `MES`, `SEMANA`, `DIAS_UTEIS_ACUMULADO_MES`, `DIAS_UTEIS_SEMANA`, `ULTIMA_DO_MES` e `MAIS_RECENTE` (1 = sim, 0 = não).
+- **O quê**: `PRODUTO`.
 - **Valor**: `VALOR_ACUMULADO_MES_USD`, `VALOR_SEMANA_USD`, `MEDIA_DIARIA_USD`, `MEDIA_DIARIA_ANO_ANTERIOR_USD`, `VARIACAO_VALOR`.
 - **Peso**: as mesmas cinco, em toneladas.
 - **Preço**: `PRECO_MEDIO_USD_TON`, `VARIACAO_PRECO`.
@@ -81,21 +99,42 @@ Convenções:
 - `VALOR_SEMANA_USD` é o acumulado da divulgação menos o da anterior do mesmo mês, e fica **vazio** quando a semana anterior não foi coletada.
 - Onde o MDIC publica 0% porque não houve embarque no mês, a coluna traz **−100%**; onde não existe base no ano anterior, fica **vazia**.
 
-### Montando no Power BI
+### Levando para o banco
+
+A tabela nova tem o mesmo formato da aba `DADOS` — uma linha por produto, uma coluna por métrica. Não é o formato da antiga `MEDIA_DIARIA_EXPORTACAO_MDIC` (longo, com os indicadores `A-1`), e nada aqui grava naquela tabela.
+
+O DDL sai do próprio código, então nunca fica fora de sincronia com o que a rotina gera:
+
+```bat
+extrair-para-excel.bat --ddl                          :: mostra o CREATE TABLE na tela
+extrair-para-excel.bat --ddl > sql\criar_tabelas.sql  :: regera o arquivo depois de mudar colunas
+```
+
+O resultado está em [`sql/criar_tabelas.sql`](sql/criar_tabelas.sql) e traz, para `DADOS` e `TEXTOS`:
+
+- o `CREATE TABLE` com os tipos já definidos;
+- um índice único na chave natural (`ANO, MES, SEMANA, FLUXO, PRODUTO`), que faz o **banco** barrar divulgação duplicada, não só a rotina;
+- um `COMMENT ON COLUMN` por coluna, com a mesma descrição da aba LEIA-ME — assim a documentação vai junto para o banco.
+
+Ajuste o nome e o esquema das tabelas ao padrão do banco de destino antes de rodar. O DDL não foi executado num banco real.
+
+Como a tabela já vem no formato largo, o Power BI lê dela direto, sem pivot e sem Power Query.
+
+### Montando no Power BI (a partir do Excel)
 
 1. Obter dados → Excel → marque as Tabelas `DADOS` e `TEXTOS`.
 2. Não precisa de relacionamento nem de tabela de dimensão: é uma tabela só. Use `DATA_REFERENCIA` como eixo de tempo.
 3. Formate as colunas `VARIACAO_*` como porcentagem e marque como **Não resumir**: variação não se soma nem se tira média.
-4. Para a variação de qualquer agrupamento (setor, total, ou uma lista de produtos sua), crie uma medida:
+4. Para a variação de um conjunto de produtos (não some as colunas `VARIACAO_*`), crie uma medida:
 
    ```dax
    Variação = DIVIDE( SUM(DADOS[MEDIA_DIARIA_USD]), SUM(DADOS[MEDIA_DIARIA_ANO_ANTERIOR_USD]) ) - 1
    ```
 
-   Saldo e corrente de comércio saem de `CALCULATE` filtrando `FLUXO`.
+   Isso dá o número certo em qualquer agrupamento dos produtos capturados. Saldo e corrente de comércio só seriam possíveis capturando também a importação.
 5. Cada divulgação é uma foto do mês até aquela semana. Por isso:
-   - painel da situação atual: filtre `MAIS_RECENTE = Verdadeiro`;
-   - comparar meses: filtre `ULTIMA_DO_MES = Verdadeiro`;
+   - painel da situação atual: filtre `MAIS_RECENTE = 1`;
+   - comparar meses: filtre `ULTIMA_DO_MES = 1`;
    - evolução dentro do mês: use `MEDIA_DIARIA_USD` no eixo `DATA_REFERENCIA`;
    - somar semanas: use `VALOR_SEMANA_USD`, nunca `VALOR_ACUMULADO_MES_USD` de divulgações diferentes do mesmo mês.
 
@@ -139,6 +178,25 @@ O arquivo `.env` (não incluído neste README) deve conter as variáveis usadas 
 | `ORACLE_WALLET_DIR`  | Diretório do Oracle Wallet (`config_dir`)            |
 
 ## Dependências principais
+
+### Rotina semanal (`extrair_para_excel.py` / `src/principais_resultados.py`)
+
+Só bibliotecas externas comuns — nada de Selenium/Chrome, Oracle ou `.env`:
+
+| Biblioteca | Versão usada | Para quê |
+|---|---|---|
+| `requests` | 2.34.2 | Baixar a página e as planilhas do MDIC |
+| `pandas` | 3.0.5 | Ler e tratar os dados das planilhas |
+| `openpyxl` | 3.1.5 | Ler `.xlsx` e gravar o Excel de saída (formatado, com Tabelas) |
+| `urllib3` | 2.7.0 | Suprimir o aviso de certificado SSL do site do governo (usa `requests`, não é instalada à parte) |
+
+O resto (`re`, `dataclasses`, `pathlib`, `html.parser`, `argparse`, `logging`, `datetime` etc.) já vem pronto no Python, sem instalar nada.
+
+```bat
+pip install requests pandas openpyxl
+```
+
+### Fluxo antigo (`main.py` / Oracle)
 
 - `selenium` + `webdriver-manager` (extração da data de atualização)
 - `pandas` + `openpyxl` (leitura/transformação da planilha)

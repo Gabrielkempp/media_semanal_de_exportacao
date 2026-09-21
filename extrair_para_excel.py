@@ -28,21 +28,35 @@ PASTA_BRUTOS = PASTA_SAIDA / 'brutos'
 ARQUIVO_EXCEL = PASTA_SAIDA / 'balanca_semanal_mdic.xlsx'
 ARQUIVO_LOG = PASTA_SAIDA / 'extracao.log'
 
-COMO_USAR = [
-    "Cada linha de DADOS é um produto (exportação ou importação) numa divulgação semanal do MDIC.",
-    "Setor e total são a soma dos produtos: some VALOR_* e PESO_* à vontade dentro de uma mesma divulgação.",
-    "Cada divulgação acumula o mês até DATA_REFERENCIA. Situação atual: filtre MAIS_RECENTE = VERDADEIRO. "
-    "Comparar meses: filtre ULTIMA_DO_MES = VERDADEIRO.",
-    "Não some VALOR_ACUMULADO_MES_USD de divulgações diferentes do mesmo mês; para somar semanas use VALOR_SEMANA_USD.",
-    "Para comparar períodos use as colunas MEDIA_DIARIA_*: cada período tem um número diferente de dias úteis.",
-    "Variação de um grupo (setor, total, lista de produtos) = soma de MEDIA_DIARIA_USD ÷ soma de "
-    "MEDIA_DIARIA_ANO_ANTERIOR_USD − 1. Nunca some nem tire média de VARIACAO_*.",
-    "Saldo = Exportação − Importação. Corrente de comércio = Exportação + Importação.",
-    "Valores em US$ e toneladas. Variações em fração (0,285 = 28,5%). O ano anterior é o mesmo mês completo, "
-    "como publicado pelo MDIC na mesma planilha.",
-    "Fonte: https://balanca.economia.gov.br/balanca/pg_principal_bc/principais_resultados.html "
-    "(arquivos originais de cada semana em saida/brutos).",
-]
+def como_usar():
+    """Regras da aba LEIA-ME, montadas a partir do que está configurado para captura."""
+    fluxos = ' e '.join(pr.FLUXOS_CAPTURADOS).lower()
+    if pr.PRODUTOS_CAPTURADOS is None:
+        escopo = (f"Cada linha de DADOS é um produto de {fluxos} numa divulgação semanal do MDIC. "
+                  f"Estão aqui todos os produtos publicados, então setor e total são a soma dos produtos.")
+        recorte = ("Some VALOR_* e PESO_* à vontade dentro de uma mesma divulgação: os produtos somam o setor "
+                   "e o total.")
+    else:
+        escopo = (f"Cada linha de DADOS é um produto de {fluxos} numa divulgação semanal do MDIC. "
+                  f"Só são gravados estes produtos: {'; '.join(pr.PRODUTOS_CAPTURADOS)}.")
+        recorte = ("ATENÇÃO: esta tabela é um recorte, não a balança inteira. A soma das linhas NÃO é o total "
+                   "do setor nem do Brasil, e não dá para calcular saldo nem corrente de comércio. A divulgação "
+                   "completa fica guardada em saida/brutos.")
+    return [
+        escopo,
+        recorte,
+        "Cada divulgação acumula o mês até DATA_REFERENCIA. Situação atual: filtre MAIS_RECENTE = 1. "
+        "Comparar meses: filtre ULTIMA_DO_MES = 1. (1 = sim, 0 = não)",
+        "Não some VALOR_ACUMULADO_MES_USD de divulgações diferentes do mesmo mês; para somar semanas use "
+        "VALOR_SEMANA_USD.",
+        "Para comparar períodos use as colunas MEDIA_DIARIA_*: cada período tem um número diferente de dias úteis.",
+        "Variação de um conjunto de produtos = soma de MEDIA_DIARIA_USD ÷ soma de MEDIA_DIARIA_ANO_ANTERIOR_USD "
+        "− 1. Nunca some nem tire média de VARIACAO_*.",
+        "Valores em US$ e toneladas. Variações em fração (0,285 = 28,5%). O ano anterior é o mesmo mês completo, "
+        "como publicado pelo MDIC na mesma planilha.",
+        "Fonte: https://balanca.economia.gov.br/balanca/pg_principal_bc/principais_resultados.html "
+        "(arquivos originais de cada semana em saida/brutos).",
+    ]
 
 log = logging.getLogger('mdic')
 
@@ -154,7 +168,7 @@ def formatar_aba(ws, df, nome):
 def escrever_leia_me(ws):
     ws.append(['Balança comercial semanal (MDIC): como usar'])
     ws['A1'].font = Font(bold=True, size=13)
-    for i, regra in enumerate(COMO_USAR, start=1):
+    for i, regra in enumerate(como_usar(), start=1):
         ws.append([f"{i}. {regra}"])
     ws.append([])
     ws.append(['TABELA', 'COLUNA', 'DESCRIÇÃO'])
@@ -232,7 +246,15 @@ def main():
     argumentos = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     argumentos.add_argument('--reprocessar', action='store_true',
                             help='reconstrói o Excel a partir de todos os arquivos brutos, sem baixar nada')
+    argumentos.add_argument('--ddl', action='store_true',
+                            help='imprime o CREATE TABLE das tabelas (para criar no banco) e sai')
     args = argumentos.parse_args()
+
+    if args.ddl:
+        for tabela in pr.ESQUEMA:
+            print(pr.ddl_tabela(tabela), end='\n\n')
+        return 0
+
     configurar_log()
 
     try:

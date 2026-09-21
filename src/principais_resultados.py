@@ -3,10 +3,14 @@ Extração da divulgação semanal "Balança Comercial Preliminar Parcial do Mê
 
 Cada divulgação vira linhas da tabela única DADOS (um produto por linha) e da tabela TEXTOS.
 Tudo é lido dos arquivos brutos da divulgação (página HTML + planilhas), que precisam ser da mesma semana.
-Setores e totais não são gravados: são a soma dos produtos (isso é validado a cada divulgação).
+
+A divulgação é lida e validada por inteiro (todos os produtos, exportação e importação); só no fim ficam
+apenas os produtos e fluxos configurados em PRODUTOS_CAPTURADOS / FLUXOS_CAPTURADOS.
 """
 import io
+import logging
 import re
+import unicodedata
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import PurePosixPath
@@ -41,6 +45,17 @@ NOMES_FLUXO = {  # como aparecem na página -> nome padronizado
     'Balança Comercial': 'Saldo', 'Corrente de Comércio': 'Corrente',
 }
 
+# ---------------------------------------------------------------- o que vai para a tabela final
+# A divulgação inteira continua sendo baixada, validada e arquivada em saida/brutos. Estes dois ajustes
+# definem só o que é gravado na tabela DADOS. Para ampliar a captura, edite as listas e rode
+# "extrair-para-excel.bat --reprocessar": todo o histórico já arquivado é refeito com os novos produtos.
+PRODUTOS_CAPTURADOS = [   # None = todos os produtos da divulgação
+    'Algodão em bruto',
+    'Madeira em bruto',
+    'Milho não moído, exceto milho doce',
+]
+FLUXOS_CAPTURADOS = [EXPORTACAO]   # [EXPORTACAO, IMPORTACAO] para capturar os dois
+
 # Dicionário de dados: define as colunas, a ordem e o texto da aba LEIA-ME
 DESCRICOES = {
     'DADOS': {
@@ -51,10 +66,8 @@ DESCRICOES = {
         'SEMANA': 'Número da divulgação no mês ("até a Nª semana").',
         'DIAS_UTEIS_ACUMULADO_MES': 'Dias úteis do dia 1º do mês até DATA_REFERENCIA.',
         'DIAS_UTEIS_SEMANA': 'Dias úteis só da semana desta divulgação.',
-        'ULTIMA_DO_MES': 'VERDADEIRO na última divulgação coletada de cada mês. Use para comparar meses.',
-        'MAIS_RECENTE': 'VERDADEIRO na divulgação mais recente. Use para ver a situação atual.',
-        'FLUXO': 'Exportação ou Importação.',
-        'SETOR': 'Setor de atividade econômica (classificação do MDIC).',
+        'ULTIMA_DO_MES': '1 na última divulgação coletada de cada mês, 0 nas demais. Use para comparar meses.',
+        'MAIS_RECENTE': '1 na divulgação mais recente, 0 nas demais. Use para ver a situação atual.',
         'PRODUTO': 'Produto (grupo CUCI), como publicado pelo MDIC.',
         'VALOR_ACUMULADO_MES_USD': 'Valor FOB em US$ do dia 1º do mês até DATA_REFERENCIA.',
         'VALOR_SEMANA_USD': 'Valor FOB em US$ só da semana (acumulado desta divulgação menos o da anterior do mesmo mês). '
@@ -77,7 +90,7 @@ DESCRICOES = {
         'ANO': 'Ano de referência.',
         'MES': 'Mês de referência.',
         'SEMANA': 'Número da divulgação no mês.',
-        'MAIS_RECENTE': 'VERDADEIRO nos textos da divulgação mais recente.',
+        'MAIS_RECENTE': '1 nos textos da divulgação mais recente, 0 nos demais.',
         'ORDEM': 'Posição do texto na página.',
         'SECAO': 'Seção da página: Destaques, Totais ou Setores e Produtos.',
         'FLUXO': 'Exportação, Importação, Saldo ou Corrente (vazio = texto geral).',
@@ -88,13 +101,28 @@ DESCRICOES = {
 ESQUEMA = {tabela: list(colunas) for tabela, colunas in DESCRICOES.items()}
 COLUNAS_INTEIRAS = {'ANO', 'MES', 'SEMANA', 'DIAS_UTEIS_ACUMULADO_MES', 'DIAS_UTEIS_SEMANA', 'ORDEM'}
 COLUNAS_DATA = {'DATA_REFERENCIA', 'DATA_PUBLICACAO'}
+COLUNAS_SIM_NAO = {'ULTIMA_DO_MES', 'MAIS_RECENTE'}   # gravadas como 1 / 0
+
+# Tipos para gerar o DDL da tabela no banco (ver ddl_tabela). Todos os nomes de coluna cabem em 30
+# caracteres, que é o limite do Oracle até a versão 12.1.
+TIPOS_ORACLE = {
+    'ANO': 'NUMBER(4)', 'MES': 'NUMBER(2)', 'SEMANA': 'NUMBER(2)', 'ORDEM': 'NUMBER(4)',
+    'DIAS_UTEIS_ACUMULADO_MES': 'NUMBER(2)', 'DIAS_UTEIS_SEMANA': 'NUMBER(2)',
+    'ULTIMA_DO_MES': 'NUMBER(1)', 'MAIS_RECENTE': 'NUMBER(1)',
+    'FLUXO': 'VARCHAR2(20)', 'SETOR': 'VARCHAR2(100)', 'PRODUTO': 'VARCHAR2(400)',
+    'SECAO': 'VARCHAR2(40)', 'SUBSECAO': 'VARCHAR2(60)', 'TEXTO': 'CLOB',
+}
+CHAVES_NATURAIS = {
+    'DADOS': ['ANO', 'MES', 'SEMANA', 'PRODUTO'],
+    'TEXTOS': ['ANO', 'MES', 'SEMANA', 'ORDEM'],
+}
 
 # (grupo do cabeçalho, período) -> (coluna de destino, fator). ATUAL = mês da divulgação; ANTERIOR = mesmo mês do ano anterior.
 # Valores vão de US$ mil para US$ e variações de % para fração (28,5% -> 0,285), como o Power BI espera.
 # Colunas iniciadas por "_" são usadas só no tratamento e não vão para a tabela.
 COLUNAS_SETORES_PRODUTOS = {
     ('US$ Mil', 'ATUAL'): ('VALOR_ACUMULADO_MES_USD', 1000),
-    ('US$ Mil', 'ANTERIOR'): None,  # total do mês do ano anterior: a média diária já basta como base
+    ('US$ Mil', 'ANTERIOR'): None,  # total do mês do ano anterior: não entra na tabela
     ('US$ Mil Por Média Diária', 'ATUAL'): ('MEDIA_DIARIA_USD', 1000),
     ('US$ Mil Por Média Diária', 'ANTERIOR'): ('MEDIA_DIARIA_ANO_ANTERIOR_USD', 1000),
     ('Toneladas', 'ATUAL'): ('PESO_ACUMULADO_MES_TON', 1),
@@ -102,7 +130,7 @@ COLUNAS_SETORES_PRODUTOS = {
     ('Toneladas por Média Diária', 'ATUAL'): ('MEDIA_DIARIA_TON', 1),
     ('Toneladas por Média Diária', 'ANTERIOR'): ('MEDIA_DIARIA_ANO_ANTERIOR_TON', 1),
     ('Preço (US$/Tonelada)', 'ATUAL'): ('PRECO_MEDIO_USD_TON', 1),
-    ('Preço (US$/Tonelada)', 'ANTERIOR'): ('_PRECO_ANO_ANTERIOR', 1),
+    ('Preço (US$/Tonelada)', 'ANTERIOR'): ('_PRECO_ANO_ANTERIOR', 1),  # só para decidir se a variação existe
     ('Variação (%) Por Média Diária', 'Valor US$'): ('VARIACAO_VALOR', 0.01),
     ('Variação (%) Por Média Diária', 'Toneladas'): ('VARIACAO_PESO', 0.01),
     ('Variação (%) Por Média Diária', 'Preço'): ('VARIACAO_PRECO', 0.01),
@@ -110,6 +138,8 @@ COLUNAS_SETORES_PRODUTOS = {
 
 # O servidor do governo não envia a cadeia completa de certificados
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+log = logging.getLogger('mdic')
 
 
 def id_publicacao(ano, mes, semana):
@@ -176,9 +206,41 @@ def ajustar_tipos(df, tabela):
             df[coluna] = df[coluna].astype('Int64')
         elif coluna in COLUNAS_DATA:
             df[coluna] = pd.to_datetime(df[coluna])
-        elif coluna in ('ULTIMA_DO_MES', 'MAIS_RECENTE'):
-            df[coluna] = df[coluna].astype(bool)
+        elif coluna in COLUNAS_SIM_NAO:
+            df[coluna] = df[coluna].astype(bool).astype('Int64')
     return df
+
+
+def _tipo_oracle(coluna):
+    if coluna in TIPOS_ORACLE:
+        return TIPOS_ORACLE[coluna]
+    if coluna in COLUNAS_DATA:
+        return 'DATE'
+    if coluna.startswith('VARIACAO_'):
+        return 'NUMBER(18,10)'          # variações podem ser enormes (ex.: 18861 = +1.886.114%)
+    if coluna.endswith('_USD'):
+        return 'NUMBER(18,6)' if 'MEDIA_DIARIA' in coluna else 'NUMBER(18,2)'
+    if coluna.endswith('_TON'):
+        return 'NUMBER(18,6)' if 'MEDIA_DIARIA' in coluna else 'NUMBER(18,3)'
+    return 'VARCHAR2(400)'
+
+
+def ddl_tabela(tabela, nome_no_banco=None, esquema=None):
+    """
+    Gera o CREATE TABLE a partir do ESQUEMA e do DESCRICOES (que viram COMMENT ON COLUMN).
+    Como sai do próprio código, o DDL nunca fica fora de sincronia com o que a rotina grava.
+    """
+    nome = '.'.join(filter(None, [esquema, nome_no_banco or f'BALANCA_SEMANAL_MDIC_{tabela}']))
+    largura = max(len(c) for c in ESQUEMA[tabela])
+    colunas = ',\n'.join(f"    {c.ljust(largura)}  {_tipo_oracle(c)}" for c in ESQUEMA[tabela])
+
+    linhas = [f"CREATE TABLE {nome} (", colunas, ");", "",
+              "-- Chave natural: o banco passa a impedir a mesma divulgação gravada duas vezes",
+              f"CREATE UNIQUE INDEX UX_{tabela} ON {nome} ({', '.join(CHAVES_NATURAIS[tabela])});", ""]
+    for coluna, descricao in DESCRICOES[tabela].items():
+        texto = ' '.join(descricao.split()).replace("'", "''")
+        linhas.append(f"COMMENT ON COLUMN {nome}.{coluna} IS '{texto}';")
+    return '\n'.join(linhas)
 
 
 # ---------------------------------------------------------------- página HTML
@@ -457,6 +519,39 @@ def validar_somas(produtos, setores, resumo, dias_uteis_produtos, tolerancia=10.
         raise ValueError("Inconsistências encontradas:\n  " + "\n  ".join(erros))
 
 
+def _chave_produto(nome):
+    """Chave de comparação do nome do produto, tolerante a acento, caixa e espaços extras."""
+    sem_acento = ''.join(c for c in unicodedata.normalize('NFKD', str(nome).lower()) if not unicodedata.combining(c))
+    return ' '.join(sem_acento.split())
+
+
+def filtrar_captura(produtos):
+    """
+    Última etapa: reduz aos fluxos e produtos configurados. Roda depois das validações, que continuam
+    conferindo a divulgação inteira. Produto configurado que não aparecer na divulgação interrompe a
+    execução — é o sinal de que o MDIC mudou o nome, e seguir em frente perderia esse produto em silêncio.
+    """
+    # Sem a coluna FLUXO na tabela, o mesmo produto de dois fluxos viraria duas linhas indistinguíveis
+    # (e o valor da semana, que casa as linhas por produto, sairia errado).
+    if len(FLUXOS_CAPTURADOS) > 1 and 'FLUXO' not in ESQUEMA['DADOS']:
+        raise ValueError("Para capturar mais de um fluxo, a coluna FLUXO precisa voltar ao ESQUEMA['DADOS'] "
+                         f"(hoje FLUXOS_CAPTURADOS = {FLUXOS_CAPTURADOS})")
+    filtrado = produtos[produtos['FLUXO'].isin(FLUXOS_CAPTURADOS)]
+    if PRODUTOS_CAPTURADOS is not None:
+        desejados = {_chave_produto(p): p for p in PRODUTOS_CAPTURADOS}
+        filtrado = filtrado[filtrado['PRODUTO'].map(_chave_produto).isin(desejados)]
+        encontrados = set(filtrado['PRODUTO'].map(_chave_produto))
+        faltando = [nome for chave, nome in desejados.items() if chave not in encontrados]
+        if faltando:
+            raise ValueError(f"Produtos configurados em PRODUTOS_CAPTURADOS que não existem na divulgação "
+                             f"(o MDIC pode ter mudado o nome): {faltando}")
+    if filtrado.empty:
+        raise ValueError(f"Nenhuma linha restou após o filtro (fluxos={FLUXOS_CAPTURADOS})")
+    log.info(f"Capturados {len(filtrado)} produtos de {len(produtos)} publicados "
+             f"(fluxos: {', '.join(FLUXOS_CAPTURADOS)})")
+    return filtrado.reset_index(drop=True)
+
+
 def processar_divulgacao(arquivos):
     """arquivos: {nome do arquivo: bytes} de uma divulgação. Retorna {'DADOS': ..., 'TEXTOS': ...}."""
     faltando = [n for n in (ARQ_PAGINA, *URLS_ESSENCIAIS) if n not in arquivos]
@@ -470,6 +565,7 @@ def processar_divulgacao(arquivos):
     resumo = extrair_tabela_resumo(arquivos[ARQ_TABELA_RESUMO], pub)
     validar_somas(produtos, setores, resumo, dias_produtos)
     produtos = corrigir_variacoes(produtos)
+    produtos = filtrar_captura(produtos)
 
     chave = {'DATA_REFERENCIA': resumo['data_referencia'], 'ANO': pub.ano, 'MES': pub.mes, 'SEMANA': pub.semana}
     dados = produtos.assign(
@@ -487,10 +583,10 @@ def processar_divulgacao(arquivos):
 def calcular_colunas_historicas(dados, textos):
     """Colunas que dependem do conjunto de divulgações: valores da semana e as marcações de recência."""
     chave = ['ANO', 'MES', 'SEMANA']
-    anterior = dados[chave + ['FLUXO', 'PRODUTO', 'VALOR_ACUMULADO_MES_USD', 'PESO_ACUMULADO_MES_TON']].copy()
+    anterior = dados[chave + ['PRODUTO', 'VALOR_ACUMULADO_MES_USD', 'PESO_ACUMULADO_MES_TON']].copy()
     anterior['SEMANA'] += 1
-    anterior.columns = chave + ['FLUXO', 'PRODUTO', '_VALOR_ANTERIOR', '_PESO_ANTERIOR']
-    dados = dados.merge(anterior, on=chave + ['FLUXO', 'PRODUTO'], how='left')
+    anterior.columns = chave + ['PRODUTO', '_VALOR_ANTERIOR', '_PESO_ANTERIOR']
+    dados = dados.merge(anterior, on=chave + ['PRODUTO'], how='left')
 
     divulgacoes = set(zip(dados['ANO'], dados['MES'], dados['SEMANA']))
     tem_anterior = pd.Series([(a, m, s - 1) in divulgacoes for a, m, s in zip(dados['ANO'], dados['MES'], dados['SEMANA'])],
