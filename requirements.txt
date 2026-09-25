@@ -1,0 +1,14 @@
+# Versões com que a rotina foi testada (Python 3.14)
+requests==2.34.2
+pandas==3.0.5
+openpyxl==3.1.5
+urllib3==2.7.0
+oci==2.187.0
+pymupdf==1.28.2
+
+# Usados pelo módulo compartilhado funcoes_uteis (\\boci01filesrv\Comercial_Dados\utils\Funcoes_Python).
+# Ele também precisa do Oracle Instant Client instalado.
+oracledb==26.0.0
+keyring==25.6.0
+python-dotenv==1.2.2
+numpy==2.5.3

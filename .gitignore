@@ -217,6 +217,6 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Saídas locais da extração (Excel de validação e arquivos brutos do MDIC)
+# Saídas locais da rotina (log)
 saida/
 Comparativo - Script Antigo vs Script Novo.docx

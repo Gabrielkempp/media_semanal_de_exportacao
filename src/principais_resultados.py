@@ -1,155 +1,83 @@
-"""
-Extração da divulgação semanal "Balança Comercial Preliminar Parcial do Mês" (MDIC/SECEX).
-
-Cada divulgação vira linhas da tabela única DADOS (um produto por linha) e da tabela TEXTOS.
-Tudo é lido dos arquivos brutos da divulgação (página HTML + planilhas), que precisam ser da mesma semana.
-
-A divulgação é lida e validada por inteiro (todos os produtos, exportação e importação); só no fim ficam
-apenas os produtos e fluxos configurados em PRODUTOS_CAPTURADOS / FLUXOS_CAPTURADOS.
-"""
+# Leitura, validação e tratamento da divulgação semanal da Balança Comercial (MDIC/SECEX).
 import io
 import logging
 import re
 import unicodedata
 from dataclasses import dataclass
-from html.parser import HTMLParser
-from pathlib import PurePosixPath
-from urllib.parse import urljoin, urlparse
 
 import pandas as pd
+import pymupdf
 import requests
 import urllib3
 
-URL_PAGINA = "https://balanca.economia.gov.br/balanca/pg_principal_bc/principais_resultados.html"
-ARQ_PAGINA = 'principais_resultados.html'
+BASE = "https://balanca.economia.gov.br/balanca/semanal/"
 ARQ_SETORES_PRODUTOS = 'Setores_Produtos.xlsx'
 ARQ_TABELA_RESUMO = 'Tabela_Resumo.xlsx'
-# Arquivos usados no processamento; os demais links da página são apenas arquivados
-URLS_ESSENCIAIS = {
-    ARQ_SETORES_PRODUTOS: urljoin(URL_PAGINA, '../semanal/Setores_Produtos.xlsx'),
-    ARQ_TABELA_RESUMO: urljoin(URL_PAGINA, '../semanal/Tabela_Resumo.xlsx'),
-}
-EXTENSOES_ARQUIVADAS = ('.xlsx', '.xls', '.csv', '.pdf', '.zip')
+ARQ_NOTA = 'Nota.pdf'
+URLS = {nome: BASE + nome for nome in (ARQ_SETORES_PRODUTOS, ARQ_TABELA_RESUMO, ARQ_NOTA)}
+PLANILHAS = (ARQ_SETORES_PRODUTOS, ARQ_TABELA_RESUMO)
 
 MESES = ['janeiro', 'fevereiro', 'março', 'abril', 'maio', 'junho',
          'julho', 'agosto', 'setembro', 'outubro', 'novembro', 'dezembro']
 MESES_ABREV = ['Jan', 'Fev', 'Mar', 'Abr', 'Mai', 'Jun', 'Jul', 'Ago', 'Set', 'Out', 'Nov', 'Dez']
 
-# O site usa "2ª" e "2º" indistintamente
+# título da planilha: 'Até 2ª Semana de Setembro/2026'
 RE_SEMANA = re.compile(r'(\d+)\s*[ªº°]?\s*semana\s+de\s+([a-zç]+)\s*/\s*(\d{4})', re.IGNORECASE)
-RE_PASTA = re.compile(r'^(\d{4})-(\d{2})_semana(\d+)$')
+# capa da Nota: '3ª Semana SETEMBRO de 2026'
+RE_SEMANA_NOTA = re.compile(r'(\d+)\s*[ªº°]?\s*semana\s+(?:de\s+)?([a-zç]+)\s+de\s+(\d{4})', re.IGNORECASE)
+# Tabela_Resumo: '3ª semana (14 a 20)'
+RE_SEMANA_RESUMO = re.compile(r'^(\d+)\s*[ªº°] semana\s*\((\d{1,2})\s*a\s*(\d{1,2})\)')
+RE_SETOR = re.compile(r'^[A-Z] - (.+)$')
 
 EXPORTACAO, IMPORTACAO = 'Exportação', 'Importação'
-NOMES_FLUXO = {  # como aparecem na página -> nome padronizado
-    'Exportações': EXPORTACAO, 'Importações': IMPORTACAO,
-    'Balança Comercial': 'Saldo', 'Corrente de Comércio': 'Corrente',
-}
 
-# ---------------------------------------------------------------- o que vai para a tabela final
-# A divulgação inteira continua sendo baixada, validada e arquivada em saida/brutos. Estes dois ajustes
-# definem só o que é gravado na tabela DADOS. Para ampliar a captura, edite as listas e rode
-# "extrair-para-excel.bat --reprocessar": todo o histórico já arquivado é refeito com os novos produtos.
-PRODUTOS_CAPTURADOS = [   # None = todos os produtos da divulgação
+# Captura: a divulgação inteira é validada; só isto é gravado (None = todos os produtos)
+PRODUTOS_CAPTURADOS = [
     'Algodão em bruto',
     'Madeira em bruto',
     'Milho não moído, exceto milho doce',
 ]
-FLUXOS_CAPTURADOS = [EXPORTACAO]   # [EXPORTACAO, IMPORTACAO] para capturar os dois
+# os dois fluxos exigem FLUXO no ESQUEMA
+FLUXOS_CAPTURADOS = [EXPORTACAO]
 
-# Dicionário de dados: define as colunas, a ordem e o texto da aba LEIA-ME
-DESCRICOES = {
-    'DADOS': {
-        'DATA_REFERENCIA': 'Último dia coberto pela divulgação: os dados vão do dia 1º do mês até esta data. Use como eixo de tempo.',
-        'DATA_PUBLICACAO': 'Data em que o MDIC publicou a divulgação.',
-        'ANO': 'Ano de referência dos dados.',
-        'MES': 'Mês de referência dos dados.',
-        'SEMANA': 'Número da divulgação no mês ("até a Nª semana").',
-        'DIAS_UTEIS_ACUMULADO_MES': 'Dias úteis do dia 1º do mês até DATA_REFERENCIA.',
-        'DIAS_UTEIS_SEMANA': 'Dias úteis só da semana desta divulgação.',
-        'ULTIMA_DO_MES': '1 na última divulgação coletada de cada mês, 0 nas demais. Use para comparar meses.',
-        'MAIS_RECENTE': '1 na divulgação mais recente, 0 nas demais. Use para ver a situação atual.',
-        'PRODUTO': 'Produto (grupo CUCI), como publicado pelo MDIC.',
-        'VALOR_ACUMULADO_MES_USD': 'Valor FOB em US$ do dia 1º do mês até DATA_REFERENCIA.',
-        'VALOR_SEMANA_USD': 'Valor FOB em US$ só da semana (acumulado desta divulgação menos o da anterior do mesmo mês). '
-                            'Vazio quando a divulgação anterior do mês não foi coletada.',
-        'MEDIA_DIARIA_USD': 'Valor por dia útil (VALOR_ACUMULADO_MES_USD ÷ DIAS_UTEIS_ACUMULADO_MES). Use para comparar períodos.',
-        'MEDIA_DIARIA_ANO_ANTERIOR_USD': 'Média diária do mesmo mês do ano anterior (mês completo), como publicada pelo MDIC '
-                                         'na mesma planilha. É a base da variação.',
-        'VARIACAO_VALOR': 'MEDIA_DIARIA_USD ÷ MEDIA_DIARIA_ANO_ANTERIOR_USD − 1, em fração (0,285 = 28,5%). '
-                          '−100% = sem embarque no mês; vazio = sem base no ano anterior.',
-        'PESO_ACUMULADO_MES_TON': 'Peso em toneladas do dia 1º do mês até DATA_REFERENCIA.',
-        'PESO_SEMANA_TON': 'Peso em toneladas só da semana (mesma lógica de VALOR_SEMANA_USD).',
-        'MEDIA_DIARIA_TON': 'Toneladas por dia útil.',
-        'MEDIA_DIARIA_ANO_ANTERIOR_TON': 'Toneladas por dia útil no mesmo mês do ano anterior (mês completo), como publicado pelo MDIC.',
-        'VARIACAO_PESO': 'MEDIA_DIARIA_TON ÷ MEDIA_DIARIA_ANO_ANTERIOR_TON − 1, em fração (mesmas regras de VARIACAO_VALOR).',
-        'PRECO_MEDIO_USD_TON': 'Preço médio em US$ por tonelada (valor ÷ peso). Vazio quando não houve peso.',
-        'VARIACAO_PRECO': 'Variação do preço médio contra o mesmo mês do ano anterior, em fração. Vazio quando um dos preços não existe.',
-    },
-    'TEXTOS': {
-        'DATA_REFERENCIA': 'Como em DADOS: liga o texto à divulgação.',
-        'ANO': 'Ano de referência.',
-        'MES': 'Mês de referência.',
-        'SEMANA': 'Número da divulgação no mês.',
-        'MAIS_RECENTE': '1 nos textos da divulgação mais recente, 0 nos demais.',
-        'ORDEM': 'Posição do texto na página.',
-        'SECAO': 'Seção da página: Destaques, Totais ou Setores e Produtos.',
-        'FLUXO': 'Exportação, Importação, Saldo ou Corrente (vazio = texto geral).',
-        'SUBSECAO': 'Subtítulo do texto na página.',
-        'TEXTO': 'Texto como publicado pelo MDIC.',
-    },
-}
-ESQUEMA = {tabela: list(colunas) for tabela, colunas in DESCRICOES.items()}
-COLUNAS_INTEIRAS = {'ANO', 'MES', 'SEMANA', 'DIAS_UTEIS_ACUMULADO_MES', 'DIAS_UTEIS_SEMANA', 'ORDEM'}
-COLUNAS_DATA = {'DATA_REFERENCIA', 'DATA_PUBLICACAO'}
-COLUNAS_SIM_NAO = {'ULTIMA_DO_MES', 'MAIS_RECENTE'}   # gravadas como 1 / 0
+ESQUEMA = [
+    'DATA_REFERENCIA', 'SEMANA', 'ULTIMA_DO_MES', 'MAIS_RECENTE', 'PRODUTO',
+    'VALOR_ACUMULADO_MES_USD', 'VALOR_SEMANA_USD', 'MEDIA_DIARIA_USD', 'VARIACAO_VALOR',
+    'PESO_ACUMULADO_MES_TON', 'PESO_SEMANA_TON', 'MEDIA_DIARIA_TON', 'VARIACAO_PESO',
+    'PRECO_MEDIO_USD_TON', 'VARIACAO_PRECO_MEDIO_TON',
+]
+CHAVE_NATURAL = ['DATA_REFERENCIA', 'PRODUTO']
+# a tabela tem também DATA_CARGA_DW, preenchida pelo banco
+TABELA_BANCO = 'BRADODW_IM_PRICING.BZ_MEDIA_SEMANAL_DE_EXPORTACAO'
+# tipos por coluna (as que não aparecem aqui são número)
+COLUNAS_INTEIRAS = {'SEMANA'}
+COLUNAS_DATA = {'DATA_REFERENCIA'}
+# gravadas como 1 / 0
+COLUNAS_SIM_NAO = {'ULTIMA_DO_MES', 'MAIS_RECENTE'}
+COLUNAS_TEXTO = {'PRODUTO'}
 
-# Tipos para gerar o DDL da tabela no banco (ver ddl_tabela). Todos os nomes de coluna cabem em 30
-# caracteres, que é o limite do Oracle até a versão 12.1.
-TIPOS_ORACLE = {
-    'ANO': 'NUMBER(4)', 'MES': 'NUMBER(2)', 'SEMANA': 'NUMBER(2)', 'ORDEM': 'NUMBER(4)',
-    'DIAS_UTEIS_ACUMULADO_MES': 'NUMBER(2)', 'DIAS_UTEIS_SEMANA': 'NUMBER(2)',
-    'ULTIMA_DO_MES': 'NUMBER(1)', 'MAIS_RECENTE': 'NUMBER(1)',
-    'FLUXO': 'VARCHAR2(20)', 'SETOR': 'VARCHAR2(100)', 'PRODUTO': 'VARCHAR2(400)',
-    'SECAO': 'VARCHAR2(40)', 'SUBSECAO': 'VARCHAR2(60)', 'TEXTO': 'CLOB',
-}
-CHAVES_NATURAIS = {
-    'DADOS': ['ANO', 'MES', 'SEMANA', 'PRODUTO'],
-    'TEXTOS': ['ANO', 'MES', 'SEMANA', 'ORDEM'],
-}
-
-# (grupo do cabeçalho, período) -> (coluna de destino, fator). ATUAL = mês da divulgação; ANTERIOR = mesmo mês do ano anterior.
-# Valores vão de US$ mil para US$ e variações de % para fração (28,5% -> 0,285), como o Power BI espera.
-# Colunas iniciadas por "_" são usadas só no tratamento e não vão para a tabela.
+# (grupo, período) -> (coluna, fator): US$ mil -> US$, % -> fração
+# "_" = uso interno; None = descartada
 COLUNAS_SETORES_PRODUTOS = {
     ('US$ Mil', 'ATUAL'): ('VALOR_ACUMULADO_MES_USD', 1000),
-    ('US$ Mil', 'ANTERIOR'): None,  # total do mês do ano anterior: não entra na tabela
+    ('US$ Mil', 'ANTERIOR'): None,
     ('US$ Mil Por Média Diária', 'ATUAL'): ('MEDIA_DIARIA_USD', 1000),
-    ('US$ Mil Por Média Diária', 'ANTERIOR'): ('MEDIA_DIARIA_ANO_ANTERIOR_USD', 1000),
+    ('US$ Mil Por Média Diária', 'ANTERIOR'): ('_MEDIA_DIARIA_ANO_ANTERIOR_USD', 1000),
     ('Toneladas', 'ATUAL'): ('PESO_ACUMULADO_MES_TON', 1),
     ('Toneladas', 'ANTERIOR'): None,
     ('Toneladas por Média Diária', 'ATUAL'): ('MEDIA_DIARIA_TON', 1),
-    ('Toneladas por Média Diária', 'ANTERIOR'): ('MEDIA_DIARIA_ANO_ANTERIOR_TON', 1),
+    ('Toneladas por Média Diária', 'ANTERIOR'): ('_MEDIA_DIARIA_ANO_ANTERIOR_TON', 1),
     ('Preço (US$/Tonelada)', 'ATUAL'): ('PRECO_MEDIO_USD_TON', 1),
-    ('Preço (US$/Tonelada)', 'ANTERIOR'): ('_PRECO_ANO_ANTERIOR', 1),  # só para decidir se a variação existe
+    ('Preço (US$/Tonelada)', 'ANTERIOR'): ('_PRECO_ANO_ANTERIOR', 1),
     ('Variação (%) Por Média Diária', 'Valor US$'): ('VARIACAO_VALOR', 0.01),
     ('Variação (%) Por Média Diária', 'Toneladas'): ('VARIACAO_PESO', 0.01),
-    ('Variação (%) Por Média Diária', 'Preço'): ('VARIACAO_PRECO', 0.01),
+    ('Variação (%) Por Média Diária', 'Preço'): ('VARIACAO_PRECO_MEDIO_TON', 0.01),
 }
 
-# O servidor do governo não envia a cadeia completa de certificados
+# site sem cadeia completa de certificados
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 log = logging.getLogger('mdic')
-
-
-def id_publicacao(ano, mes, semana):
-    """Identificador da divulgação no formato AAAAMMS, ex.: 2ª semana de set/2026 -> 2026092."""
-    return ano * 1000 + mes * 10 + semana
-
-
-def id_da_pasta(nome):
-    m = RE_PASTA.match(nome)
-    return id_publicacao(int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
 
 
 @dataclass
@@ -157,23 +85,14 @@ class Publicacao:
     ano: int
     mes: int
     semana: int
-    data_publicacao: pd.Timestamp
 
-    @property
-    def id(self):
-        return id_publicacao(self.ano, self.mes, self.semana)
-
+    # Ex.: 'Set/2026'.
     def rotulo_mes(self, ano=None):
-        """Rótulo usado nos cabeçalhos das planilhas, ex.: 'Set/2026'."""
         return f"{MESES_ABREV[self.mes - 1]}/{ano or self.ano}"
 
     @property
     def descricao(self):
         return f"{self.rotulo_mes()} - {self.semana}ª semana"
-
-    @property
-    def pasta(self):
-        return f"{self.ano}-{self.mes:02d}_semana{self.semana}"
 
 
 def baixar(url):
@@ -182,25 +101,29 @@ def baixar(url):
     return response.content
 
 
-def ler_periodo(texto):
-    """'Até 2ª Semana de Setembro/2026' -> (2, 9, 2026)."""
-    m = RE_SEMANA.search(texto)
+# 'Até 2ª Semana de Setembro/2026' -> Publicacao(2026, 9, 2).
+def ler_periodo(texto, padrao=RE_SEMANA):
+    m = padrao.search(texto)
     if not m:
         raise ValueError(f"Período de referência não encontrado em: {texto!r}")
     nome_mes = m.group(2).lower()
     if nome_mes not in MESES:
         raise ValueError(f"Mês desconhecido {nome_mes!r} em: {texto!r}")
-    return int(m.group(1)), MESES.index(nome_mes) + 1, int(m.group(3))
+    return Publicacao(ano=int(m.group(3)), mes=MESES.index(nome_mes) + 1, semana=int(m.group(1)))
 
 
-def validar_periodo(pub, texto, fonte):
-    if ler_periodo(texto) != (pub.semana, pub.mes, pub.ano):
-        raise ValueError(f"{fonte} não é da mesma divulgação da página ({pub.descricao}): {texto!r}")
+# A Nota é baixada à parte das planilhas: erro se a capa for de outra semana.
+def conferir_nota(conteudo, pub):
+    with pymupdf.open(stream=conteudo, filetype='pdf') as pdf:
+        capa = ' '.join(pdf[0].get_text().split())
+    periodo = ler_periodo(capa, padrao=RE_SEMANA_NOTA)
+    if periodo != pub:
+        raise ValueError(f"{ARQ_NOTA} é de {periodo.descricao}, mas as planilhas são de {pub.descricao}")
 
 
-def ajustar_tipos(df, tabela):
-    """Ordena as colunas conforme o ESQUEMA e padroniza os tipos (inteiros, datas, verdadeiro/falso)."""
-    df = df[ESQUEMA[tabela]].copy()
+# Colunas do ESQUEMA, na ordem, com os tipos padronizados.
+def ajustar_tipos(df):
+    df = df[ESQUEMA].copy()
     for coluna in df.columns:
         if coluna in COLUNAS_INTEIRAS:
             df[coluna] = df[coluna].astype('Int64')
@@ -211,182 +134,30 @@ def ajustar_tipos(df, tabela):
     return df
 
 
-def _tipo_oracle(coluna):
-    if coluna in TIPOS_ORACLE:
-        return TIPOS_ORACLE[coluna]
-    if coluna in COLUNAS_DATA:
-        return 'DATE'
-    if coluna.startswith('VARIACAO_'):
-        return 'NUMBER(18,10)'          # variações podem ser enormes (ex.: 18861 = +1.886.114%)
-    if coluna.endswith('_USD'):
-        return 'NUMBER(18,6)' if 'MEDIA_DIARIA' in coluna else 'NUMBER(18,2)'
-    if coluna.endswith('_TON'):
-        return 'NUMBER(18,6)' if 'MEDIA_DIARIA' in coluna else 'NUMBER(18,3)'
-    return 'VARCHAR2(400)'
-
-
-def ddl_tabela(tabela, nome_no_banco=None, esquema=None):
-    """
-    Gera o CREATE TABLE a partir do ESQUEMA e do DESCRICOES (que viram COMMENT ON COLUMN).
-    Como sai do próprio código, o DDL nunca fica fora de sincronia com o que a rotina grava.
-    """
-    nome = '.'.join(filter(None, [esquema, nome_no_banco or f'BALANCA_SEMANAL_MDIC_{tabela}']))
-    largura = max(len(c) for c in ESQUEMA[tabela])
-    colunas = ',\n'.join(f"    {c.ljust(largura)}  {_tipo_oracle(c)}" for c in ESQUEMA[tabela])
-
-    linhas = [f"CREATE TABLE {nome} (", colunas, ");", "",
-              "-- Chave natural: o banco passa a impedir a mesma divulgação gravada duas vezes",
-              f"CREATE UNIQUE INDEX UX_{tabela} ON {nome} ({', '.join(CHAVES_NATURAIS[tabela])});", ""]
-    for coluna, descricao in DESCRICOES[tabela].items():
-        texto = ' '.join(descricao.split()).replace("'", "''")
-        linhas.append(f"COMMENT ON COLUMN {nome}.{coluna} IS '{texto}';")
-    return '\n'.join(linhas)
-
-
-# ---------------------------------------------------------------- página HTML
-
-class _ParserPagina(HTMLParser):
-    """Lê cabeçalho da publicação, links de download e textos das seções Destaques, Totais e Setores e Produtos."""
-    SECOES = {'destaques': 'Destaques', 'totais': 'Totais', 'setores-e-produtos': 'Setores e Produtos'}
-    CAPTURADAS = ('p', 'h2', 'h3', 'h4', 'li', 'strong')
-
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.divs = []            # (id, classes) das divs abertas
-        self.titulos = {}         # 'h3'/'h4' -> (texto, profundidade da div que o contém)
-        self.captura = None       # (tag, classes) do elemento cujo texto está sendo lido
-        self.buffer = []
-        self.periodo = None
-        self.datas = []
-        self.links = []
-        self.paragrafos = []      # na ordem em que aparecem na página
-        self.destaque = {}        # caixa de destaque em leitura
-
-    def _secao(self):
-        return next((self.SECOES[i] for i, _ in self.divs if i in self.SECOES), None)
-
-    def handle_starttag(self, tag, attrs):
-        attrs = dict(attrs)
-        classes = (attrs.get('class') or '').split()
-        if tag == 'div':
-            self.divs.append((attrs.get('id'), classes))
-        elif tag == 'a' and attrs.get('href'):
-            self.links.append(attrs['href'])
-        elif tag in self.CAPTURADAS and self.captura is None:
-            self.captura = (tag, classes)
-            self.buffer = []
-
-    def handle_endtag(self, tag):
-        if tag == 'div' and self.divs:
-            self.divs.pop()
-            self.titulos = {h: t for h, t in self.titulos.items() if t[1] <= len(self.divs)}
-            return
-        if not self.captura or tag != self.captura[0]:
-            return
-        _, classes = self.captura
-        self.captura = None
-        texto = ' '.join(''.join(self.buffer).split())
-        secao = self._secao()
-        classes_div = self.divs[-1][1] if self.divs else []
-
-        if tag == 'h2' and 'mes' in classes:
-            self.periodo = texto
-        elif tag == 'h4' and 'date' in classes:
-            self.datas.append(texto)
-        elif secao == 'Destaques':
-            self._ler_destaque(tag, classes, classes_div, texto)
-        elif secao and tag in ('h3', 'h4'):
-            self.titulos[tag] = (texto, len(self.divs))
-        elif secao and tag == 'p' and texto:
-            self.paragrafos.append({'SECAO': secao, 'FLUXO': self.titulos.get('h3', (None,))[0],
-                                    'SUBSECAO': self.titulos.get('h4', (None,))[0], 'itens': [texto]})
-
-    def _ler_destaque(self, tag, classes, classes_div, texto):
-        # Cada caixa tem um título (fluxo), subtítulos (mês / acumulado) e itens <li class="texto">
-        if tag == 'p' and 'titulo' in classes_div:
-            self.destaque = {'FLUXO': texto}
-        elif tag == 'strong' and 'subtitulo' in classes_div:
-            self.destaque = {'SECAO': 'Destaques', 'FLUXO': self.destaque.get('FLUXO'), 'SUBSECAO': texto, 'itens': []}
-            self.paragrafos.append(self.destaque)
-        elif tag == 'li' and 'texto' in classes and 'itens' in self.destaque:
-            self.destaque['itens'].append(texto)
-
-    def handle_data(self, data):
-        if self.captura:
-            self.buffer.append(data)
-
-
-def analisar_pagina(html):
-    parser = _ParserPagina()
-    parser.feed(html)
-    parser.close()
-    return parser
-
-
-def publicacao_da_pagina(parser):
-    if not parser.periodo:
-        raise ValueError("Cabeçalho do período (h2.mes) não encontrado na página")
-    semana, mes, ano = ler_periodo(parser.periodo)
-    atualizado = next((d for d in parser.datas if d.startswith('Atualizado em')), None)
-    if not atualizado:
-        raise ValueError(f"Data de atualização não encontrada nos h4.date: {parser.datas}")
-    data_publicacao = pd.to_datetime(atualizado.split('em ')[1].strip(), format='%d/%m/%Y')
-    return Publicacao(ano, mes, semana, data_publicacao)
-
-
-def links_da_pagina(parser):
-    """{nome do arquivo: url} de todos os arquivos para download da página (+ os essenciais)."""
-    arquivos = dict(URLS_ESSENCIAIS)
-    for href in parser.links:
-        url = urljoin(URL_PAGINA, href.strip().strip('"\''))  # o site tem um href com aspas sobrando
-        nome = PurePosixPath(urlparse(url).path).name
-        if nome.lower().endswith(EXTENSOES_ARQUIVADAS):
-            arquivos.setdefault(nome, url)
-    return arquivos
-
-
-def _juntar_itens(itens):
-    """['Total:', 'US$ 3,36 bilhões', 'crescimento de 193,8%'] -> 'Total: US$ 3,36 bilhões; crescimento de 193,8%'."""
-    if len(itens) > 1 and itens[0].endswith(':'):
-        return f"{itens[0]} {'; '.join(itens[1:])}"
-    return '; '.join(itens)
-
-
-def textos_da_pagina(parser):
-    secoes = {p['SECAO'] for p in parser.paragrafos}
-    if secoes != set(_ParserPagina.SECOES.values()):
-        raise ValueError(f"Seções de texto esperadas não encontradas. Encontradas: {secoes}")
-    return pd.DataFrame([{
-        'ORDEM': ordem,
-        'SECAO': p['SECAO'],
-        'FLUXO': NOMES_FLUXO.get(p['FLUXO'], p['FLUXO']),
-        'SUBSECAO': p['SUBSECAO'],
-        'TEXTO': _juntar_itens(p['itens']),
-    } for ordem, p in enumerate(parser.paragrafos, start=1)])
-
-
-# ---------------------------------------------------------------- Setores_Produtos.xlsx
-
-def extrair_setores_produtos(conteudo, pub):
-    """Retorna (produtos, setores, dias úteis do mês). Setores são usados só para validar a soma dos produtos."""
-    produtos, setores = [], []
-    dias_uteis = None
-    periodos = {pub.rotulo_mes(): 'ATUAL', pub.rotulo_mes(pub.ano - 1): 'ANTERIOR'}
+# Retorna (publicação, produtos, setores, dias úteis do mês). Setores: só para validação.
+def extrair_setores_produtos(conteudo):
+    produtos, setores, pub, dias_uteis = [], [], None, None
+    planilha = pd.ExcelFile(io.BytesIO(conteudo))
     for aba, fluxo in (('EXP', EXPORTACAO), ('IMP', IMPORTACAO)):
-        df = pd.read_excel(io.BytesIO(conteudo), sheet_name=aba, header=None)
+        df = planilha.parse(aba, header=None)
 
-        # Ex.: "EXPORTAÇÃO BRASILEIRA\nCUCI ...\nSet/2026: 8 dias úteis; Set/2025: 22 dias úteis.\nAté 2ª Semana ..."
+        # "... Set/2026: 8 dias úteis; ... Até 2ª Semana de Setembro/2026"
         titulo = str(df.iat[3, 0])
-        validar_periodo(pub, titulo, f"{ARQ_SETORES_PRODUTOS} [{aba}]")
+        periodo = ler_periodo(titulo)
+        if pub is None:
+            pub = periodo
+        elif periodo != pub:
+            raise ValueError(f"{ARQ_SETORES_PRODUTOS}: aba {aba} é de {periodo.descricao}, mas EXP é de {pub.descricao}")
         m = re.search(re.escape(pub.rotulo_mes()) + r':\s*(\d+)\s*dias', titulo)
         dias_uteis = int(m.group(1)) if m else None
 
-        # Cabeçalho: grupo na linha 5 (células mescladas) e período/subtítulo na linha 7
+        # cabeçalho com células mescladas
         grupos = df.iloc[4].ffill()
         subtitulos = df.iloc[6]
         if grupos[0] != 'Descrição':
             raise ValueError(f"Layout inesperado em {ARQ_SETORES_PRODUTOS} [{aba}]: {grupos.tolist()}")
 
+        periodos = {pub.rotulo_mes(): 'ATUAL', pub.rotulo_mes(pub.ano - 1): 'ANTERIOR'}
         colunas = {}
         for c in range(1, df.shape[1]):
             grupo, sub = grupos[c], subtitulos[c]
@@ -401,37 +172,29 @@ def extrair_setores_produtos(conteudo, pub):
         if faltando:
             raise ValueError(f"Colunas não encontradas em {ARQ_SETORES_PRODUTOS} [{aba}]: {faltando}")
 
-        setor = None
-        for _, linha in df.iloc[8:].iterrows():
-            descricao = linha[0]
-            if pd.isna(descricao) or str(descricao).startswith('Fonte:'):
-                continue
-            descricao = ' '.join(str(descricao).split())
-            registro = {'FLUXO': fluxo}
-            for c, (destino, fator) in colunas.items():
-                valor = float(linha[c]) * fator if pd.notna(linha[c]) else None
-                # O acumulado vem exato em US$ (3 casas em US$ mil): o arredondamento só tira ruído da multiplicação.
-                # Médias diárias ficam com a precisão da fonte, senão a variação de produtos pequenos se distorce.
-                registro[destino] = round(valor, 2) if valor is not None and destino == 'VALOR_ACUMULADO_MES_USD' else valor
-            m = re.match(r'^[A-Z] - (.+)$', descricao)
-            if m:
-                setor = m.group(1)
-                setores.append({**registro, 'SETOR': setor})
-            else:
-                produtos.append({**registro, 'SETOR': setor, 'PRODUTO': descricao})
+        corpo = df.iloc[8:, [0, *colunas]]
+        corpo = corpo[corpo[0].notna()]
+        descricao = corpo[0].astype(str).str.split().str.join(' ')
+        manter = ~descricao.str.startswith('Fonte:')
+        corpo, descricao = corpo[manter], descricao[manter]
 
-    return pd.DataFrame(produtos), pd.DataFrame(setores), dias_uteis
+        linhas = pd.DataFrame({destino: corpo[c].astype(float) * fator for c, (destino, fator) in colunas.items()})
+        # acumulado: 2 casas tiram o ruído do x1000; médias mantêm a precisão da fonte
+        linhas['VALOR_ACUMULADO_MES_USD'] = linhas['VALOR_ACUMULADO_MES_USD'].map(lambda v: round(v, 2))
+        setor = descricao.str.extract(RE_SETOR, expand=False)
+        linhas = linhas.assign(FLUXO=fluxo, SETOR=setor.ffill())
+        eh_setor = setor.notna()
+        setores.append(linhas[eh_setor])
+        produtos.append(linhas[~eh_setor].assign(PRODUTO=descricao[~eh_setor]))
+
+    return pub, pd.concat(produtos, ignore_index=True), pd.concat(setores, ignore_index=True), dias_uteis
 
 
+# Corrige os 0% do MDIC (-100% ou sem base) e o preço 0 sem peso; confere o resto.
 def corrigir_variacoes(produtos):
-    """
-    A planilha do MDIC mostra 0% quando a variação é -100% (sem embarque no mês) ou quando não existe base no ano
-    anterior (variação indefinida), e preço 0 quando não houve peso. Aqui cada caso recebe o valor correto.
-    Nos demais casos confere se a variação publicada bate com média atual ÷ base − 1.
-    """
     df = produtos
-    for variacao, atual, base in (('VARIACAO_VALOR', 'MEDIA_DIARIA_USD', 'MEDIA_DIARIA_ANO_ANTERIOR_USD'),
-                                  ('VARIACAO_PESO', 'MEDIA_DIARIA_TON', 'MEDIA_DIARIA_ANO_ANTERIOR_TON')):
+    for variacao, atual, base in (('VARIACAO_VALOR', 'MEDIA_DIARIA_USD', '_MEDIA_DIARIA_ANO_ANTERIOR_USD'),
+                                  ('VARIACAO_PESO', 'MEDIA_DIARIA_TON', '_MEDIA_DIARIA_ANO_ANTERIOR_TON')):
         normais = (df[atual] > 0) & (df[base] > 0)
         calculada = df.loc[normais, atual] / df.loc[normais, base] - 1
         divergentes = (calculada - df.loc[normais, variacao]).abs() > 1e-6 + 1e-6 * calculada.abs()
@@ -443,17 +206,12 @@ def corrigir_variacoes(produtos):
 
     sem_preco = df['PRECO_MEDIO_USD_TON'].fillna(0) == 0
     df.loc[sem_preco, 'PRECO_MEDIO_USD_TON'] = None
-    df.loc[sem_preco | (df['_PRECO_ANO_ANTERIOR'].fillna(0) == 0), 'VARIACAO_PRECO'] = None
-    return df.drop(columns=['_PRECO_ANO_ANTERIOR'])
+    df.loc[sem_preco | (df['_PRECO_ANO_ANTERIOR'].fillna(0) == 0), 'VARIACAO_PRECO_MEDIO_TON'] = None
+    return df
 
 
-# ---------------------------------------------------------------- Tabela_Resumo.xlsx
-
+# Data de referência, dias úteis e totais do mês (US$) para validação.
 def extrair_tabela_resumo(conteudo, pub):
-    """
-    Lê da Tabela_Resumo o que a tabela de produtos não traz: datas e dias úteis de cada semana, e os totais
-    do mês (US$) usados para validar a soma dos produtos.
-    """
     df = pd.read_excel(io.BytesIO(conteudo), header=None)
     rotulos = df[0].fillna('').astype(str).str.strip()
     nome_mes = MESES[pub.mes - 1].capitalize()
@@ -467,16 +225,18 @@ def extrair_tabela_resumo(conteudo, pub):
             or df.iloc[cab[0] + 1, 2:10].tolist() != ['Valor', 'Média p/ dia útil'] * 4):
         raise ValueError(f"Layout inesperado no cabeçalho de {ARQ_TABELA_RESUMO}")
 
-    def valores(i):  # exportação e importação em US$ (a planilha está em US$ milhões)
+    # US$ milhões -> US$
+    def valores(i):
         return {EXPORTACAO: float(df.iat[i, 2]) * 1e6, IMPORTACAO: float(df.iat[i, 4]) * 1e6}
 
+    re_mes = re.compile(rf'^{nome_mes} \(até a (\d+)\s*[ªº°] semana\)$')
     mes, semanas = None, {}
     for i, rotulo in rotulos.items():
-        if m := re.match(rf'^{nome_mes} \(até a (\d+)\s*[ªº°] semana\)$', rotulo):
+        if m := re_mes.match(rotulo):
             if int(m.group(1)) != pub.semana:
-                raise ValueError(f"{ARQ_TABELA_RESUMO} não é da mesma divulgação da página: {rotulo!r}")
+                raise ValueError(f"{ARQ_TABELA_RESUMO} não é da mesma divulgação de {ARQ_SETORES_PRODUTOS}: {rotulo!r}")
             mes = {'dias_uteis': int(df.iat[i, 1]), 'valores': valores(i)}
-        elif m := re.match(r'^(\d+)\s*[ªº°] semana\s*\((\d{1,2})\s*a\s*(\d{1,2})\)', rotulo):
+        elif m := RE_SEMANA_RESUMO.match(rotulo):
             semanas[int(m.group(1))] = {'dias_uteis': int(df.iat[i, 1]), 'dia_fim': int(m.group(3)), 'valores': valores(i)}
 
     if mes is None or set(semanas) != set(range(1, pub.semana + 1)):
@@ -486,26 +246,23 @@ def extrair_tabela_resumo(conteudo, pub):
         if abs(soma - mes['valores'][fluxo]) > 10:
             raise ValueError(f"{ARQ_TABELA_RESUMO}: soma das semanas de {fluxo} ({soma:,.2f}) != mês ({mes['valores'][fluxo]:,.2f})")
 
-    atual = semanas[pub.semana]
     return {
-        'data_referencia': pd.Timestamp(pub.ano, pub.mes, atual['dia_fim']),
+        'data_referencia': pd.Timestamp(pub.ano, pub.mes, semanas[pub.semana]['dia_fim']),
         'dias_uteis_mes': mes['dias_uteis'],
-        'dias_uteis_semana': atual['dias_uteis'],
         'total_mes_usd': mes['valores'],
     }
 
 
-# ---------------------------------------------------------------- processamento
-
+# Confere somas (produtos = setor, setores = total), repetidos e dias úteis.
 def validar_somas(produtos, setores, resumo, dias_uteis_produtos, tolerancia=10.0):
-    """Produtos somam o setor (valor e base do ano anterior) e os setores somam o total da Tabela_Resumo."""
     erros = []
-    if produtos.duplicated(['FLUXO', 'PRODUTO']).any():
-        erros.append(f"Produtos repetidos: {produtos[produtos.duplicated(['FLUXO', 'PRODUTO'])]['PRODUTO'].tolist()}")
+    repetidos = produtos.duplicated(['FLUXO', 'PRODUTO'])
+    if repetidos.any():
+        erros.append(f"Produtos repetidos: {produtos.loc[repetidos, 'PRODUTO'].tolist()}")
     for fluxo in (EXPORTACAO, IMPORTACAO):
         s = setores[setores['FLUXO'] == fluxo].set_index('SETOR')
         p = produtos[produtos['FLUXO'] == fluxo].groupby('SETOR')
-        for coluna in ('VALOR_ACUMULADO_MES_USD', 'MEDIA_DIARIA_ANO_ANTERIOR_USD'):
+        for coluna in ('VALOR_ACUMULADO_MES_USD', '_MEDIA_DIARIA_ANO_ANTERIOR_USD'):
             for setor, soma in p[coluna].sum().items():
                 if abs(soma - s.at[setor, coluna]) > tolerancia:
                     erros.append(f"{fluxo}/{setor}: soma dos produtos em {coluna} ({soma:,.2f}) != setor ({s.at[setor, coluna]:,.2f})")
@@ -519,28 +276,23 @@ def validar_somas(produtos, setores, resumo, dias_uteis_produtos, tolerancia=10.
         raise ValueError("Inconsistências encontradas:\n  " + "\n  ".join(erros))
 
 
+# Ignora acento, caixa e espaços extras.
 def _chave_produto(nome):
-    """Chave de comparação do nome do produto, tolerante a acento, caixa e espaços extras."""
     sem_acento = ''.join(c for c in unicodedata.normalize('NFKD', str(nome).lower()) if not unicodedata.combining(c))
     return ' '.join(sem_acento.split())
 
 
+# Reduz aos fluxos e produtos configurados. Produto não encontrado = erro.
 def filtrar_captura(produtos):
-    """
-    Última etapa: reduz aos fluxos e produtos configurados. Roda depois das validações, que continuam
-    conferindo a divulgação inteira. Produto configurado que não aparecer na divulgação interrompe a
-    execução — é o sinal de que o MDIC mudou o nome, e seguir em frente perderia esse produto em silêncio.
-    """
-    # Sem a coluna FLUXO na tabela, o mesmo produto de dois fluxos viraria duas linhas indistinguíveis
-    # (e o valor da semana, que casa as linhas por produto, sairia errado).
-    if len(FLUXOS_CAPTURADOS) > 1 and 'FLUXO' not in ESQUEMA['DADOS']:
-        raise ValueError("Para capturar mais de um fluxo, a coluna FLUXO precisa voltar ao ESQUEMA['DADOS'] "
+    if len(FLUXOS_CAPTURADOS) > 1 and 'FLUXO' not in ESQUEMA:
+        raise ValueError("Para capturar mais de um fluxo, a coluna FLUXO precisa entrar no ESQUEMA "
                          f"(hoje FLUXOS_CAPTURADOS = {FLUXOS_CAPTURADOS})")
     filtrado = produtos[produtos['FLUXO'].isin(FLUXOS_CAPTURADOS)]
     if PRODUTOS_CAPTURADOS is not None:
         desejados = {_chave_produto(p): p for p in PRODUTOS_CAPTURADOS}
-        filtrado = filtrado[filtrado['PRODUTO'].map(_chave_produto).isin(desejados)]
-        encontrados = set(filtrado['PRODUTO'].map(_chave_produto))
+        chaves = filtrado['PRODUTO'].map(_chave_produto)
+        filtrado = filtrado[chaves.isin(desejados)]
+        encontrados = set(chaves)
         faltando = [nome for chave, nome in desejados.items() if chave not in encontrados]
         if faltando:
             raise ValueError(f"Produtos configurados em PRODUTOS_CAPTURADOS que não existem na divulgação "
@@ -552,54 +304,44 @@ def filtrar_captura(produtos):
     return filtrado.reset_index(drop=True)
 
 
+# {nome do arquivo: bytes} -> (publicação, linhas da tabela).
 def processar_divulgacao(arquivos):
-    """arquivos: {nome do arquivo: bytes} de uma divulgação. Retorna {'DADOS': ..., 'TEXTOS': ...}."""
-    faltando = [n for n in (ARQ_PAGINA, *URLS_ESSENCIAIS) if n not in arquivos]
+    faltando = [nome for nome in PLANILHAS if nome not in arquivos]
     if faltando:
         raise ValueError(f"Arquivos ausentes na divulgação: {faltando}")
 
-    parser = analisar_pagina(arquivos[ARQ_PAGINA].decode('utf-8'))
-    pub = publicacao_da_pagina(parser)
-    textos = textos_da_pagina(parser)
-    produtos, setores, dias_produtos = extrair_setores_produtos(arquivos[ARQ_SETORES_PRODUTOS], pub)
-    resumo = extrair_tabela_resumo(arquivos[ARQ_TABELA_RESUMO], pub)
-    validar_somas(produtos, setores, resumo, dias_produtos)
-    produtos = corrigir_variacoes(produtos)
-    produtos = filtrar_captura(produtos)
+    pub, produtos, setores, dias_produtos = extrair_setores_produtos(arquivos[ARQ_SETORES_PRODUTOS])
+    resumo = extrair_tabela_resumo(arquivos[ARQ_TABELA_RESUMO], pub=pub)
+    validar_somas(produtos, setores, resumo, dias_uteis_produtos=dias_produtos)
+    produtos = filtrar_captura(corrigir_variacoes(produtos))
 
-    chave = {'DATA_REFERENCIA': resumo['data_referencia'], 'ANO': pub.ano, 'MES': pub.mes, 'SEMANA': pub.semana}
     dados = produtos.assign(
-        **chave,
-        DATA_PUBLICACAO=pub.data_publicacao,
-        DIAS_UTEIS_ACUMULADO_MES=resumo['dias_uteis_mes'],
-        DIAS_UTEIS_SEMANA=resumo['dias_uteis_semana'],
-        # Dependem das outras divulgações; calculadas em calcular_colunas_historicas
+        DATA_REFERENCIA=resumo['data_referencia'],
+        SEMANA=pub.semana,
+        # calculadas depois, com o histórico (calcular_colunas_historicas)
         VALOR_SEMANA_USD=None, PESO_SEMANA_TON=None, ULTIMA_DO_MES=True, MAIS_RECENTE=True,
     )
-    textos = textos.assign(**chave, MAIS_RECENTE=True)
-    return {'DADOS': ajustar_tipos(dados, 'DADOS'), 'TEXTOS': ajustar_tipos(textos, 'TEXTOS')}
+    return pub, ajustar_tipos(dados)
 
 
-def calcular_colunas_historicas(dados, textos):
-    """Colunas que dependem do conjunto de divulgações: valores da semana e as marcações de recência."""
-    chave = ['ANO', 'MES', 'SEMANA']
-    anterior = dados[chave + ['PRODUTO', 'VALOR_ACUMULADO_MES_USD', 'PESO_ACUMULADO_MES_TON']].copy()
+# Valores da semana e marcações de recência, que dependem das outras divulgações.
+def calcular_colunas_historicas(dados):
+    dados = dados.assign(_MES=pd.to_datetime(dados['DATA_REFERENCIA']).dt.to_period('M'))
+    chave = ['_MES', 'SEMANA', 'PRODUTO']
+    anterior = dados[chave + ['VALOR_ACUMULADO_MES_USD', 'PESO_ACUMULADO_MES_TON']].copy()
     anterior['SEMANA'] += 1
-    anterior.columns = chave + ['PRODUTO', '_VALOR_ANTERIOR', '_PESO_ANTERIOR']
-    dados = dados.merge(anterior, on=chave + ['PRODUTO'], how='left')
+    anterior.columns = chave + ['_VALOR_ANTERIOR', '_PESO_ANTERIOR']
+    dados = dados.merge(anterior, on=chave, how='left')
 
-    divulgacoes = set(zip(dados['ANO'], dados['MES'], dados['SEMANA']))
-    tem_anterior = pd.Series([(a, m, s - 1) in divulgacoes for a, m, s in zip(dados['ANO'], dados['MES'], dados['SEMANA'])],
-                             index=dados.index)
+    divulgacoes = set(zip(dados['_MES'], dados['SEMANA']))
+    tem_anterior = [(mes, semana - 1) in divulgacoes for mes, semana in zip(dados['_MES'], dados['SEMANA'])]
     primeira = dados['SEMANA'] == 1
     for destino, acumulado, ja_acumulado in (('VALOR_SEMANA_USD', 'VALOR_ACUMULADO_MES_USD', '_VALOR_ANTERIOR'),
                                              ('PESO_SEMANA_TON', 'PESO_ACUMULADO_MES_TON', '_PESO_ANTERIOR')):
-        # Produto ausente na divulgação anterior do mês tinha acumulado 0; sem a divulgação anterior, fica vazio
+        # produto ausente na semana anterior = 0; semana anterior não coletada = vazio
         base = dados[ja_acumulado].fillna(0).where(tem_anterior).mask(primeira, 0)
         dados[destino] = (dados[acumulado] - base).round(3)
 
-    dados['ULTIMA_DO_MES'] = dados['SEMANA'] == dados.groupby(['ANO', 'MES'])['SEMANA'].transform('max')
-    mais_recente = dados['DATA_REFERENCIA'].max()
-    dados['MAIS_RECENTE'] = dados['DATA_REFERENCIA'] == mais_recente
-    textos = textos.assign(MAIS_RECENTE=textos['DATA_REFERENCIA'] == mais_recente)
-    return ajustar_tipos(dados, 'DADOS'), ajustar_tipos(textos, 'TEXTOS')
+    dados['ULTIMA_DO_MES'] = dados['SEMANA'] == dados.groupby('_MES')['SEMANA'].transform('max')
+    dados['MAIS_RECENTE'] = dados['DATA_REFERENCIA'] == dados['DATA_REFERENCIA'].max()
+    return ajustar_tipos(dados)
